@@ -28,19 +28,28 @@ EMBED_DIM = 128
 
 def clean_text(t: str) -> str:
     t = t.lower()
-    t = re.sub(r"http\S+|www\S+|https\S+", " url ", t)
-    t = re.sub(r"[^a-z0-9\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"http\\S+|www\\S+|https\\S+", " url ", t)
+    t = re.sub(r"[^a-z0-9\\s]", " ", t)
+    t = re.sub(r"\\s+", " ", t).strip()
     return t
 
 
+# ✅ UPDATED MODEL: recurrent dropout + increased dropout
 def build_model():
     model = Sequential()
     model.add(Embedding(input_dim=MAX_WORDS, output_dim=EMBED_DIM, input_length=MAX_LEN))
-    model.add(Bidirectional(LSTM(64)))
-    model.add(Dropout(0.5))
+
+    model.add(Bidirectional(LSTM(
+        64,
+        dropout=0.3,           # added
+        recurrent_dropout=0.3  # added
+    )))
+
+    model.add(Dropout(0.6))    # increased dropout
+
     model.add(Dense(64, activation="relu"))
-    model.add(Dropout(0.5))
+    model.add(Dropout(0.6))    # increased dropout
+
     model.add(Dense(1, activation="sigmoid"))
     model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
@@ -114,8 +123,7 @@ def normalize_labels(series: pd.Series) -> pd.Series:
 
     def map_label(x):
         x_str = str(x).strip().lower()
-        # numeric labels: assume 0 = human, 1 = AI
-        if x_str.isdigit():
+        if x_str.isdigit():  # already numeric
             return int(x_str)
         if x_str in mapping:
             return mapping[x_str]
@@ -136,16 +144,8 @@ def load_and_standardize_csv(file) -> pd.DataFrame:
     out["text_"] = df[text_col].astype(str).apply(clean_text)
     out["label"] = normalize_labels(df[label_col])
 
-    # Optional metadata, used for filters if present
-    if cat_col:
-        out["category"] = df[cat_col].astype(str)
-    else:
-        out["category"] = "Unknown"
-
-    if rating_col:
-        out["rating"] = df[rating_col]
-    else:
-        out["rating"] = np.nan
+    out["category"] = df[cat_col].astype(str) if cat_col else "Unknown"
+    out["rating"] = df[rating_col] if rating_col else np.nan
 
     return out
 
@@ -205,7 +205,7 @@ st.write("Label distribution (0 = Original/Human, 1 = AI/CG):")
 st.bar_chart(df_all["label"].value_counts())
 
 # ------------------------
-# Optional Filters (category / rating)
+# Optional Filters
 # ------------------------
 df_filtered = df_all.copy()
 
@@ -214,22 +214,13 @@ st.sidebar.subheader("Filter before training")
 if "category" in df_all.columns:
     categories = sorted(df_all["category"].dropna().unique())
     if categories:
-        selected_cats = st.sidebar.multiselect(
-            "Select Categories to include",
-            options=categories,
-            default=categories,
-        )
+        selected_cats = st.sidebar.multiselect("Select Categories", categories, default=categories)
         df_filtered = df_filtered[df_filtered["category"].isin(selected_cats)]
 
 if "rating" in df_all.columns and df_all["rating"].notna().any():
     ratings = sorted(df_all["rating"].dropna().unique())
-    if len(ratings) > 0:
-        selected_ratings = st.sidebar.multiselect(
-            "Select Ratings",
-            options=list(ratings),
-            default=list(ratings),
-        )
-        df_filtered = df_filtered[df_filtered["rating"].isin(selected_ratings)]
+    selected_ratings = st.sidebar.multiselect("Select Ratings", ratings, default=ratings)
+    df_filtered = df_filtered[df_filtered["rating"].isin(selected_ratings)]
 
 if df_filtered.empty:
     st.warning("No records left after applying filters.")
@@ -244,11 +235,7 @@ labels = df_filtered["label"].values
 # Train / Test Split & Tokenization
 # ------------------------
 X_train_txt, X_test_txt, y_train, y_test = train_test_split(
-    texts,
-    labels,
-    test_size=0.2,
-    random_state=42,
-    stratify=labels,
+    texts, labels, test_size=0.2, random_state=42, stratify=labels
 )
 
 tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<OOV>")
@@ -262,17 +249,27 @@ X_test = pad_sequences(tokenizer.texts_to_sequences(X_test_txt), maxlen=MAX_LEN)
 # ------------------------
 st.sidebar.divider()
 
+#  ✅ UPDATED TRAINING BLOCK WITH EARLY STOPPING
 if st.sidebar.button("🟦 Train New Model"):
     model = build_model()
+
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=2,
+        restore_best_weights=True
+    )
+
     with st.spinner("Training model..."):
         model.fit(
             X_train,
             y_train,
             validation_split=0.2,
-            epochs=5,
+            epochs=10,     # we allow more epochs; early stopping prevents overfitting
             batch_size=64,
             verbose=1,
+            callbacks=[early_stop]
         )
+
     model.save(MODEL_PATH)
     st.session_state.model = model
     st.session_state.tokenizer = tokenizer
@@ -282,7 +279,7 @@ if st.sidebar.button("🟩 Load Saved Model"):
     if os.path.exists(MODEL_PATH):
         model = load_model(MODEL_PATH)
         st.session_state.model = model
-        st.session_state.tokenizer = tokenizer  # tokenizer based on current data
+        st.session_state.tokenizer = tokenizer
         st.success("Model loaded successfully.")
     else:
         st.error("No saved model found. Train first.")
@@ -342,11 +339,8 @@ if model is not None:
         st.write("### Explainability (Clean View)")
 
         exp = lime_explain(model, tok, cleaned)
-
-        # Get weighted words
         weights = exp.as_list()
 
-        # Separate contributions
         ai_words = [w for w, v in weights if v > 0]
         human_words = [w for w, v in weights if v < 0]
 
@@ -359,29 +353,20 @@ if model is not None:
             st.markdown("#### 🔷 Indicates Human-style")
             st.write(", ".join(human_words[:8]) if human_words else "None")
 
-        # Highlight words
         def highlight_text(text, ai_words, human_words):
-            result = text.split()
-            final = []
-
             ai_set = {a.lower() for a in ai_words}
             human_set = {h.lower() for h in human_words}
+            result = []
 
-            for word in result:
+            for word in text.split():
                 w = word.lower().strip(".,!?")
-
                 if w in ai_set:
-                    final.append(
-                        f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>"
-                    )
+                    result.append(f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>")
                 elif w in human_set:
-                    final.append(
-                        f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>"
-                    )
+                    result.append(f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>")
                 else:
-                    final.append(word)
-
-            return " ".join(final)
+                    result.append(word)
+            return " ".join(result)
 
         highlighted = highlight_text(user_text, ai_words, human_words)
 
