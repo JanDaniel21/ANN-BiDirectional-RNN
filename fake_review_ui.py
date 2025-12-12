@@ -11,7 +11,6 @@ from sklearn.metrics import classification_report, confusion_matrix
 import tensorflow as tf
 import tensorflow.keras.backend as K
 
-
 # --- CPU Optimization (Ryzen 3600) ---
 tf.config.threading.set_intra_op_parallelism_threads(12)
 tf.config.threading.set_inter_op_parallelism_threads(6)
@@ -24,8 +23,6 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Embedding, Bidirectional, GRU, LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import AdamW
 from tensorflow.keras import regularizers
-
-
 
 # ------------------------
 # CONFIG
@@ -42,9 +39,9 @@ EMBED_DIM = 256
 
 def clean_text(t: str) -> str:
     t = t.lower()
-    t = re.sub(r"http\\S+|www\\S+|https\\S+", " url ", t)
-    t = re.sub(r"[^a-z0-9\\s]", " ", t)
-    t = re.sub(r"\\s+", " ", t).strip()
+    t = re.sub(r"http\S+|www\S+|https\S+", " url ", t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
@@ -56,11 +53,13 @@ def focal_loss(gamma=2., alpha=.25):
         pt = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
         loss = -alpha * K.pow(1. - pt, gamma) * K.log(pt)
         return K.mean(loss)
+    # Return the inner function so it can be used as a loss
     return focal_loss_fixed
 
 # 
 from tensorflow.keras import regularizers
 from tensorflow.keras.optimizers import AdamW
+
 
 def build_model():
     model = Sequential()
@@ -102,23 +101,100 @@ def build_model():
     return model
 
 
+# ------------------------
+# Improved LIME explainability
+# ------------------------
 
+def lime_explain(model, tokenizer, raw_text):
+    """
+    Improved LIME explanation using:
+    - raw text (not fully cleaned for LIME perturbations, but predictions use cleaned)
+    - more features
+    - a classifier wrapper that accepts list-of-strings and returns probs for both classes
+    """
 
-def lime_explain(model, tokenizer, text):
-    explainer = LimeTextExplainer(class_names=["Original", "AI Generated"])
+    explainer = LimeTextExplainer(
+        class_names=["Original", "AI Generated"],
+        bow=False,                 # use token positions for better context-aware perturbations
+        split_expression=r"\W+",   # split by non-word chars to preserve tokens neatly
+    )
 
-    def pred_fn(samples):
-        seq = tokenizer.texts_to_sequences(samples)
+    def pred_fn(text_list):
+        # LIME gives raw text perturbations; we clean for prediction as the model was trained on cleaned text
+        cleaned = [clean_text(t) for t in text_list]
+        seq = tokenizer.texts_to_sequences(cleaned)
         padded = pad_sequences(seq, maxlen=MAX_LEN)
-        preds = model.predict(padded)
+        preds = model.predict(padded, verbose=0)
+        # preds are probability of class 1 (AI). LIME expects array [[p(class0), p(class1)], ...]
         return np.hstack([1 - preds, preds])
 
-    exp = explainer.explain_instance(
-        text_instance=text,
+    # produce explanation: increased features and samples for more stable results
+    explanation = explainer.explain_instance(
+        raw_text,
         classifier_fn=pred_fn,
-        num_features=10,
+        num_features=30,     # provide more tokens to inspect
+        num_samples=3000,    # increase perturbations for stability (may be heavier)
     )
-    return exp
+
+    return explanation
+
+
+def render_lime_bar(weights, title):
+    st.markdown(f"#### {title}")
+    if not weights:
+        st.write("None")
+        return
+
+    # show top tokens with their weights and a small visual bar
+    for word, score in weights[:20]:
+        # normalize magnitude for a small inline bar visual
+        mag = min(1.0, abs(score) / 0.8)  # heuristic scale
+        pct = f"{abs(score):.4f}"
+        if score > 0:
+            # AI indicator (warm)
+            bg = f"linear-gradient(90deg, rgba(255,120,0,{mag}) {int(mag*100)}%, transparent 0%)"
+            side = "AI-style"
+        else:
+            # Human indicator (cool)
+            bg = f"linear-gradient(90deg, rgba(0,120,255,{mag}) {int(mag*100)}%, transparent 0%)"
+            side = "Human-style"
+
+        st.markdown(
+            f"""
+            <div style="padding:6px;border-radius:6px;margin:4px 0;background:{bg}">
+                <b>{word}</b> — <span style="opacity:0.9">{pct}</span> — <small style="opacity:0.8">{side}</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def weighted_highlight(text, weights):
+    """
+    Highlight tokens in the original text with intensity based on LIME weight.
+    weights: list of (token, weight)
+    """
+    weight_map = {w.lower(): v for w, v in weights}
+    tokens = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)  # keep punctuation separate
+    out = []
+    for tok in tokens:
+        key = tok.lower()
+        # strip punctuation for lookup
+        key_stripped = re.sub(r"[^\w]", "", key)
+        if key_stripped and key_stripped in weight_map:
+            w = weight_map[key_stripped]
+            opacity = min(0.9, max(0.15, abs(w) * 2.2))
+            if w > 0:
+                # AI-style: warm
+                bg = f"rgba(255,120,0,{opacity})"
+            else:
+                # Human-style: cool
+                bg = f"rgba(0,120,255,{opacity})"
+
+            out.append(f"<span style='background:{bg};padding:3px 5px;border-radius:4px;margin:1px'>{tok}</span>")
+        else:
+            out.append(tok)
+    return " ".join(out)
 
 
 # --------- automatic column / label handling ----------
@@ -332,10 +408,17 @@ if st.sidebar.button("🟦 Train New Model"):
 
 if st.sidebar.button("🟩 Load Saved Model"):
     if os.path.exists(MODEL_PATH):
-        model = load_model(MODEL_PATH)
-        st.session_state.model = model
-        st.session_state.tokenizer = tokenizer
-        st.success("Model loaded successfully.")
+        try:
+            # load without compiling then recompile (robust to custom loss)
+            model = load_model(MODEL_PATH, compile=False)
+            # recompile with same loss & optimizer so evaluate/predict work as expected
+            optimizer = AdamW(learning_rate=3e-4, weight_decay=1e-4)
+            model.compile(loss=focal_loss(gamma=2, alpha=0.25), optimizer=optimizer, metrics=["accuracy"])
+            st.session_state.model = model
+            st.session_state.tokenizer = tokenizer
+            st.success("Model loaded successfully.")
+        except Exception as e:
+            st.error(f"Failed to load model: {e}")
     else:
         st.error("No saved model found. Train first.")
 
@@ -349,20 +432,25 @@ if model is not None:
 
     st.subheader("📑 Model Performance")
 
-    loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    try:
+        loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    except Exception:
+        # If evaluate fails for some reason, default to NA but continue
+        loss, acc = np.nan, np.nan
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Accuracy", f"{acc:.4f}")
+        st.metric("Accuracy", f"{acc:.4f}" if not np.isnan(acc) else "N/A")
     with col2:
-        st.metric("Loss", f"{loss:.4f}")
+        st.metric("Loss", f"{loss:.4f}" if not np.isnan(loss) else "N/A")
 
-    y_pred = (model.predict(X_test) > 0.5).astype(int)
-
-    st.code(classification_report(y_test, y_pred), language="text")
-
-    st.write("Confusion Matrix:")
-    st.write(confusion_matrix(y_test, y_pred))
+    try:
+        y_pred = (model.predict(X_test) > 0.5).astype(int)
+        st.code(classification_report(y_test, y_pred), language="text")
+        st.write("Confusion Matrix:")
+        st.write(confusion_matrix(y_test, y_pred))
+    except Exception as e:
+        st.write("Prediction / reporting skipped due to error:", e)
 
     st.divider()
     st.subheader("🔍 Test a Review")
@@ -373,7 +461,11 @@ if model is not None:
         cleaned = clean_text(user_text)
         seq = tok.texts_to_sequences([cleaned])
         pad_seq = pad_sequences(seq, maxlen=MAX_LEN)
-        prob = model.predict(pad_seq)[0][0]
+        try:
+            prob = float(model.predict(pad_seq, verbose=0)[0][0])
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+            prob = 0.0
 
         THRESHOLD = 0.40
         label = "AI-Generated" if prob >= THRESHOLD else "Original"
@@ -390,47 +482,51 @@ if model is not None:
         )
 
         # ------------------------
-        # CLEAN EXPLAINABILITY
+        # CLEAN EXPLAINABILITY (UPGRADED)
         # ------------------------
         st.write("### Explainability (Clean View)")
 
-        exp = lime_explain(model, tok, cleaned)
-        weights = exp.as_list()
+        try:
+            exp = lime_explain(model, tok, user_text)
+            weights = exp.as_list()
+        except Exception as e:
+            st.error(f"LIME explanation failed: {e}")
+            weights = []
 
+        # Separate positive/negative weights
         ai_words = [w for w, v in weights if v > 0]
         human_words = [w for w, v in weights if v < 0]
 
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### 🔶 Indicates AI-style")
-            st.write(", ".join(ai_words[:8]) if ai_words else "None")
+            # show compact token list
+            st.write(", ".join(ai_words[:20]) if ai_words else "None")
 
         with col2:
             st.markdown("#### 🔷 Indicates Human-style")
-            st.write(", ".join(human_words[:8]) if human_words else "None")
+            st.write(", ".join(human_words[:20]) if human_words else "None")
 
-        def highlight_text(text, ai_words, human_words):
-            ai_set = {a.lower() for a in ai_words}
-            human_set = {h.lower() for h in human_words}
-            result = []
+        # render more detailed bar-style explanation
+        st.divider()
+        st.subheader("🔎 Detailed Token Influence")
 
-            for word in text.split():
-                w = word.lower().strip(".,!?")
-                if w in ai_set:
-                    result.append(f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>")
-                elif w in human_set:
-                    result.append(f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>")
-                else:
-                    result.append(word)
-            return " ".join(result)
+        # Sort weights by absolute influence
+        sorted_weights = sorted(weights, key=lambda x: -abs(x[1])) if weights else []
 
-        highlighted = highlight_text(user_text, ai_words, human_words)
+        ai_influences = [(w, v) for w, v in sorted_weights if v > 0]
+        human_influences = [(w, v) for w, v in sorted_weights if v < 0]
 
-        st.markdown("#### Highlighted Sentence Interpretation", unsafe_allow_html=True)
-        st.markdown(
-            f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlighted}</div>",
-            unsafe_allow_html=True,
-        )
+        colA, colB = st.columns(2)
+        with colA:
+            render_lime_bar(ai_influences, "Top AI-Style Indicators")
+        with colB:
+            render_lime_bar(human_influences, "Top Human-Style Indicators")
+
+        # Highlight text with weighted intensity
+        st.markdown("### 🖍️ Text Highlight Interpretation", unsafe_allow_html=True)
+        highlight_html = weighted_highlight(user_text, sorted_weights)
+        st.markdown(f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlight_html}</div>", unsafe_allow_html=True)
 
 else:
     st.info("Train or load a model to enable evaluation and prediction.")
