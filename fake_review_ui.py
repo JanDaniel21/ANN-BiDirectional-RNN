@@ -7,19 +7,33 @@ from lime.lime_text import LimeTextExplainer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 
+# TensorFlow import
 import tensorflow as tf
+import tensorflow.keras.backend as K
+
+
+# --- CPU Optimization (Ryzen 3600) ---
+tf.config.threading.set_intra_op_parallelism_threads(12)
+tf.config.threading.set_inter_op_parallelism_threads(6)
+tf.config.optimizer.set_jit(True)
+
+# --- Keras imports ---
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Embedding, Bidirectional, GRU, Dense, Dropout
+from tensorflow.keras.layers import Embedding, Bidirectional, GRU, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import AdamW
+from tensorflow.keras import regularizers
+
+
 
 # ------------------------
 # CONFIG
 # ------------------------
 MODEL_PATH = "best_model.h5"
 MAX_WORDS = 20000
-MAX_LEN = 200
-EMBED_DIM = 128
+MAX_LEN = 350
+EMBED_DIM = 256
 
 # ------------------------
 # Helper Functions
@@ -28,36 +42,66 @@ EMBED_DIM = 128
 
 def clean_text(t: str) -> str:
     t = t.lower()
-    t = re.sub(r"http\S+|www\S+|https\S+", " url ", t)
-    t = re.sub(r"[^a-z0-9\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"http\\S+|www\\S+|https\\S+", " url ", t)
+    t = re.sub(r"[^a-z0-9\\s]", " ", t)
+    t = re.sub(r"\\s+", " ", t).strip()
     return t
 
 
-# ✅ UPDATED MODEL: swapped LSTM for GRU, with recurrent dropout and added sensible defaults
+def focal_loss(gamma=2., alpha=.25):
+    def focal_loss_fixed(y_true, y_pred):
+        y_true = K.cast(y_true, tf.float32)
+        y_pred = K.clip(y_pred, K.epsilon(), 1 - K.epsilon())
+
+        pt = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
+        loss = -alpha * K.pow(1. - pt, gamma) * K.log(pt)
+        return K.mean(loss)
+    return focal_loss_fixed
+
+# 
+from tensorflow.keras import regularizers
+from tensorflow.keras.optimizers import AdamW
+
 def build_model():
     model = Sequential()
     model.add(Embedding(input_dim=MAX_WORDS, output_dim=EMBED_DIM, input_length=MAX_LEN))
 
-    # Single bidirectional GRU. Use return_sequences=True if you plan to stack more recurrent layers.
-    model.add(
-        Bidirectional(
-            GRU(
-                64,
-                dropout=0.3,           # input-to-hidden dropout
-                recurrent_dropout=0.3  # recurrent dropout
-            )
-        )
+    model.add(Bidirectional(GRU(
+        256,
+        dropout=0.3,
+        recurrent_dropout=0.3,
+        kernel_regularizer=regularizers.L1L2(l1=1e-5, l2=1e-4),
+        recurrent_regularizer=regularizers.L1L2(l1=1e-5, l2=1e-4),
+        bias_regularizer=regularizers.L2(1e-4)
+    )))
+
+    model.add(Dropout(0.6))
+
+    model.add(Dense(
+        64, activation="relu",
+        kernel_regularizer=regularizers.L2(1e-4)
+    ))
+    model.add(Dropout(0.6))
+
+    model.add(Dense(
+        1, activation="sigmoid",
+        kernel_regularizer=regularizers.L2(1e-4)
+    ))
+
+    optimizer = AdamW(
+        learning_rate=3e-4,
+        weight_decay=1e-4
     )
 
-    model.add(Dropout(0.6))    # increased dropout
+    model.compile(
+        loss=focal_loss(gamma=2, alpha=0.25),
+        optimizer=optimizer,
+        metrics=["accuracy"]
+    )
 
-    model.add(Dense(64, activation="relu"))
-    model.add(Dropout(0.6))    # increased dropout
-
-    model.add(Dense(1, activation="sigmoid"))
-    model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
+
+
 
 
 def lime_explain(model, tokenizer, text):
@@ -67,8 +111,6 @@ def lime_explain(model, tokenizer, text):
         seq = tokenizer.texts_to_sequences(samples)
         padded = pad_sequences(seq, maxlen=MAX_LEN)
         preds = model.predict(padded)
-        # preds shape: (n,1) -> flatten to (n,)
-        preds = preds.reshape(-1, 1) if preds.ndim == 1 else preds
         return np.hstack([1 - preds, preds])
 
     exp = explainer.explain_instance(
@@ -126,6 +168,7 @@ def normalize_labels(series: pd.Series) -> pd.Series:
         "or": 0,
         "original": 0,
         "human": 0,
+        "Simulated Human": 0,
     }
 
     def map_label(x):
@@ -134,11 +177,6 @@ def normalize_labels(series: pd.Series) -> pd.Series:
             return int(x_str)
         if x_str in mapping:
             return mapping[x_str]
-        # fallback: try to interpret boolean-like values
-        if x_str in ("true", "t", "1"):
-            return 1
-        if x_str in ("false", "f", "0"):
-            return 0
         raise ValueError(f"Unknown label value: {x}")
 
     return series.apply(map_label)
@@ -156,17 +194,8 @@ def load_and_standardize_csv(file) -> pd.DataFrame:
     out["text_"] = df[text_col].astype(str).apply(clean_text)
     out["label"] = normalize_labels(df[label_col])
 
-    # category -> if column present, convert to string; else fill with "Unknown"
-    if cat_col:
-        out["category"] = df[cat_col].astype(str)
-    else:
-        out["category"] = "Unknown"
-
-    # rating -> present column or NaN
-    if rating_col:
-        out["rating"] = df[rating_col]
-    else:
-        out["rating"] = np.nan
+    out["category"] = df[cat_col].astype(str) if cat_col else "Unknown"
+    out["rating"] = df[rating_col] if rating_col else np.nan
 
     return out
 
@@ -187,7 +216,7 @@ if "tokenizer" not in st.session_state:
     st.session_state.tokenizer = None
 
 st.title("🧠 AI-Generated Review Detector")
-st.caption("Bi-directional GRU + LIME Explainability")
+st.caption("Bi-directional RNN + LIME Explainability")
 
 # multiple dataset uploader
 uploaded_files = st.sidebar.file_uploader(
@@ -212,14 +241,10 @@ for f in uploaded_files:
     except Exception as e:
         st.sidebar.error(f"{f.name}: {e}")
 
-# safety: if nothing loaded, show helpful message and stop
 if not df_list:
-    st.error(
-        "No valid datasets loaded. Make sure your CSVs contain a text column (e.g., 'text', 'review', 'content') and a label column (e.g., 'label', 'class', 'review_type')."
-    )
+    st.error("No valid datasets loaded.")
     st.stop()
 
-# concatenate only when we have data (prevents ValueError: No objects to concatenate)
 df_all = pd.concat(df_list, ignore_index=True)
 
 st.subheader("📊 Combined Dataset Preview")
@@ -227,11 +252,7 @@ st.write(f"Total samples: **{len(df_all)}**")
 st.dataframe(df_all.head())
 
 st.write("Label distribution (0 = Original/Human, 1 = AI/CG):")
-# guard: if label column missing or all NaN
-if "label" in df_all.columns and df_all["label"].notna().any():
-    st.bar_chart(df_all["label"].value_counts())
-else:
-    st.write("No valid label column found in combined dataset.")
+st.bar_chart(df_all["label"].value_counts())
 
 # ------------------------
 # Optional Filters
@@ -263,11 +284,6 @@ labels = df_filtered["label"].values
 # ------------------------
 # Train / Test Split & Tokenization
 # ------------------------
-# guard: check label distribution to avoid stratify errors
-if len(np.unique(labels)) == 1:
-    st.error("Only a single class present in the filtered data. Need both classes (0 and 1) to train.")
-    st.stop()
-
 X_train_txt, X_test_txt, y_train, y_test = train_test_split(
     texts, labels, test_size=0.2, random_state=42, stratify=labels
 )
@@ -289,35 +305,37 @@ if st.sidebar.button("🟦 Train New Model"):
 
     early_stop = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
-        patience=2,
+        patience=3,
         restore_best_weights=True
     )
+
+    # Apply heavier weight to AI-generated class (1)
+    class_weights = {0: 1.0, 1: 1.5}
 
     with st.spinner("Training model..."):
         model.fit(
             X_train,
             y_train,
             validation_split=0.2,
-            epochs=10,     # we allow more epochs; early stopping prevents overfitting
-            batch_size=64,
+            epochs=25,
+            batch_size=128,
             verbose=1,
-            callbacks=[early_stop]
+            callbacks=[early_stop],
+            class_weight=class_weights
         )
 
     model.save(MODEL_PATH)
     st.session_state.model = model
     st.session_state.tokenizer = tokenizer
-    st.success(f"Model trained and saved as {MODEL_PATH}")
+    st.success("Model trained and saved as best_model.h5")
+
 
 if st.sidebar.button("🟩 Load Saved Model"):
     if os.path.exists(MODEL_PATH):
-        try:
-            model = load_model(MODEL_PATH)
-            st.session_state.model = model
-            st.session_state.tokenizer = tokenizer
-            st.success("Model loaded successfully.")
-        except Exception as e:
-            st.error(f"Failed to load model: {e}")
+        model = load_model(MODEL_PATH)
+        st.session_state.model = model
+        st.session_state.tokenizer = tokenizer
+        st.success("Model loaded successfully.")
     else:
         st.error("No saved model found. Train first.")
 
@@ -331,36 +349,20 @@ if model is not None:
 
     st.subheader("📑 Model Performance")
 
-    try:
-        loss, acc = model.evaluate(X_test, y_test, verbose=0)
-    except Exception as e:
-        st.error(f"Evaluation failed: {e}")
-        loss, acc = np.nan, np.nan
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
 
     col1, col2 = st.columns(2)
     with col1:
-        try:
-            st.metric("Accuracy", f"{acc:.4f}")
-        except Exception:
-            st.metric("Accuracy", "N/A")
+        st.metric("Accuracy", f"{acc:.4f}")
     with col2:
-        try:
-            st.metric("Loss", f"{loss:.4f}")
-        except Exception:
-            st.metric("Loss", "N/A")
+        st.metric("Loss", f"{loss:.4f}")
 
-    try:
-        preds_raw = model.predict(X_test)
-        y_pred = (preds_raw > 0.5).astype(int).reshape(-1)
-        st.code(classification_report(y_test, y_pred), language="text")
-    except Exception as e:
-        st.warning(f"Prediction/Evaluation metrics failed: {e}")
+    y_pred = (model.predict(X_test) > 0.5).astype(int)
+
+    st.code(classification_report(y_test, y_pred), language="text")
 
     st.write("Confusion Matrix:")
-    try:
-        st.write(confusion_matrix(y_test, y_pred))
-    except Exception as e:
-        st.write(f"Could not compute confusion matrix: {e}")
+    st.write(confusion_matrix(y_test, y_pred))
 
     st.divider()
     st.subheader("🔍 Test a Review")
@@ -371,13 +373,10 @@ if model is not None:
         cleaned = clean_text(user_text)
         seq = tok.texts_to_sequences([cleaned])
         pad_seq = pad_sequences(seq, maxlen=MAX_LEN)
-        try:
-            prob = float(model.predict(pad_seq)[0][0])
-        except Exception as e:
-            st.error(f"Prediction failed: {e}")
-            prob = 0.0
+        prob = model.predict(pad_seq)[0][0]
 
-        label = "AI-Generated" if prob >= 0.5 else "Original"
+        THRESHOLD = 0.40
+        label = "AI-Generated" if prob >= THRESHOLD else "Original"
         color = "#ffcccc" if prob >= 0.5 else "#ccffcc"
 
         st.markdown(
@@ -392,49 +391,46 @@ if model is not None:
 
         # ------------------------
         # CLEAN EXPLAINABILITY
-        # ----------------
-        try:
-            st.write("### Explainability (Clean View)")
+        # ------------------------
+        st.write("### Explainability (Clean View)")
 
-            exp = lime_explain(model, tok, cleaned)
-            weights = exp.as_list()
+        exp = lime_explain(model, tok, cleaned)
+        weights = exp.as_list()
 
-            ai_words = [w for w, v in weights if v > 0]
-            human_words = [w for w, v in weights if v < 0]
+        ai_words = [w for w, v in weights if v > 0]
+        human_words = [w for w, v in weights if v < 0]
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### 🔶 Indicates AI-style")
-                st.write(", ".join(ai_words[:8]) if ai_words else "None")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### 🔶 Indicates AI-style")
+            st.write(", ".join(ai_words[:8]) if ai_words else "None")
 
-            with col2:
-                st.markdown("#### 🔷 Indicates Human-style")
-                st.write(", ".join(human_words[:8]) if human_words else "None")
+        with col2:
+            st.markdown("#### 🔷 Indicates Human-style")
+            st.write(", ".join(human_words[:8]) if human_words else "None")
 
-            def highlight_text(text, ai_words, human_words):
-                ai_set = {a.lower() for a in ai_words}
-                human_set = {h.lower() for h in human_words}
-                result = []
+        def highlight_text(text, ai_words, human_words):
+            ai_set = {a.lower() for a in ai_words}
+            human_set = {h.lower() for h in human_words}
+            result = []
 
-                for word in text.split():
-                    w = word.lower().strip(".,!?")
-                    if w in ai_set:
-                        result.append(f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>")
-                    elif w in human_set:
-                        result.append(f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>")
-                    else:
-                        result.append(word)
-                return " ".join(result)
+            for word in text.split():
+                w = word.lower().strip(".,!?")
+                if w in ai_set:
+                    result.append(f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>")
+                elif w in human_set:
+                    result.append(f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>")
+                else:
+                    result.append(word)
+            return " ".join(result)
 
-            highlighted = highlight_text(user_text, ai_words, human_words)
+        highlighted = highlight_text(user_text, ai_words, human_words)
 
-            st.markdown("#### Highlighted Sentence Interpretation", unsafe_allow_html=True)
-            st.markdown(
-                f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlighted}</div>",
-                unsafe_allow_html=True,
-            )
-        except Exception as e:
-            st.warning(f"Explainability failed: {e}")
+        st.markdown("#### Highlighted Sentence Interpretation", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlighted}</div>",
+            unsafe_allow_html=True,
+        )
 
 else:
     st.info("Train or load a model to enable evaluation and prediction.")
