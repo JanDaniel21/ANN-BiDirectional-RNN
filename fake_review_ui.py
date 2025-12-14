@@ -30,7 +30,7 @@ from tensorflow.keras import regularizers
 MODEL_PATH = "best_model.h5"
 MAX_WORDS = 20000
 MAX_LEN = 350
-EMBED_DIM = 256
+EMBED_DIM = 128
 
 # ------------------------
 # Helper Functions
@@ -66,7 +66,7 @@ def build_model():
     model.add(Embedding(input_dim=MAX_WORDS, output_dim=EMBED_DIM, input_length=MAX_LEN))
 
     model.add(Bidirectional(GRU(
-        256,
+        128,
         dropout=0.3,
         recurrent_dropout=0.3,
         kernel_regularizer=regularizers.L1L2(l1=1e-5, l2=1e-4),
